@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ants Protocol - Queen & Large World</title>
+  <style>
+    /* Basic Page Reset */
+    html, body {
+      margin: 0; 
+      padding: 0;
+      width: 100%; 
+      height: 100%;
+      background: #1a1a1a;
+      font-family: monospace;
+      color: #fff;
+      /* Let's allow scrolling if container is bigger */
+      overflow: auto; 
+    }
+
+    /* Header / Control Panel */
+    #controlPanel {
+      position: fixed; /* pinned so you can always see it */
+      top: 10px;
+      left: 10px;
+      background: rgba(0,0,0,0.6);
+      padding: 12px;
+      border: 1px solid #888;
+      border-radius: 6px;
+      z-index: 9999;
+      width: 220px;
+    }
+    #controlPanel h3 {
+      margin: 0 0 8px;
+    }
+    #controlPanel label {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    #controlPanel input[type="range"] {
+      width: 100%;
+    }
+    #controlPanel button {
+      margin-top: 8px;
+      width: 100%;
+      padding: 6px;
+      background: #333;
+      color: #fff;
+      border: 1px solid #666;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #controlPanel button:hover {
+      background: #444;
+    }
+    #colonyStats {
+      margin-top: 6px;
+      font-size: 0.9em;
+      color: #afffaf;
+    }
+
+    /* The big container for ants: 3000×2000 for scrolling space */
+    #antsContainer {
+      position: relative;
+      width: 3000px;   /* large “world” width */
+      height: 2000px;  /* large “world” height */
+      margin: 0 auto;  /* center horizontally if body is bigger, optional */
+      background: #1a1a1a;
+    }
+
+    /* Each ant is a small element with transitions for movement */
+    .ant {
+      position: absolute;
+      pointer-events: auto;
+      user-select: none;
+      font-size: 1.2rem;
+      transition: transform 1s; /* smooth movement */
+    }
+    /* Queen is bigger & red */
+    .queen {
+      font-size: 2rem;
+      color: #f00;
+      font-weight: bold;
+    }
+
+    /* Tooltip for addresses & categories */
+    .tooltip {
+      position: fixed; /* so it stays in place even if we scroll */
+      background: #000;
+      color: #0f0;
+      padding: 4px 6px;
+      border: 1px solid #0f0;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      display: none; /* hidden by default */
+      pointer-events: none;
+      white-space: pre; /* so we can do multi-line text easily */
+      z-index: 10000;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Control Panel -->
+  <div id="controlPanel">
+    <h3>Ants Protocol</h3>
+    <label># Ants
+      <input id="numAntsRange" type="range" min="5" max="100" value="20">
+    </label>
+    <label>Speed
+      <input id="speedRange" type="range" min="0.1" max="2" step="0.1" value="0.5">
+    </label>
+    <button id="respawnBtn">Respawn Colony</button>
+    <div id="colonyStats"></div>
+    <p style="margin-top: 8px; font-size: 0.85em;">
+      Click anywhere in the colony to feed ants—<br>
+      they'll swarm the food for a moment!<br>
+      Otherwise, they follow their Queen.
+    </p>
+  </div>
+
+  <!-- The large “world” container for ants -->
+  <div id="antsContainer"></div>
+
+  <!-- Tooltip for addresses -->
+  <div class="tooltip" id="tooltip"></div>
+
+  <script>
+    /**************************************************
+     * 1) CONFIG ARRAYS & VARIABLES
+     **************************************************/
+    // Categories for non-queen ants
+    const categories = [
+      { type: 'Early Holder', color: '#00ff00' },
+      { type: 'Whale',        color: '#ff00ff' },
+      { type: 'Airdrop',      color: '#00ffff' },
+      { type: 'Ordinary',     color: '#ffffff' }
+    ];
+
+    // Our ants data
+    let ants = [];            // each ant: { x, y, vx, vy, el, isQueen, category, address, balance }
+    let feedX = null;         // x coord of “food”
+    let feedY = null;         // y coord of “food”
+    let feedMode = false;     // if ants should move toward feed
+    let feedTimer = null;     // to stop feed mode
+
+    // Collisions & Flocking
+    const COLLISION_RADIUS = 30; 
+    const BOUNCE_FORCE = 0.02;   
+
+    // The queen ant is bigger, different color, we store reference
+    let queen = null;
+
+    // UI references
+    const antsContainer = document.getElementById('antsContainer');
+    const tooltipEl = document.getElementById('tooltip');
+    const colonyStats = document.getElementById('colonyStats');
+
+    const numAntsRange = document.getElementById('numAntsRange');
+    const speedRange   = document.getElementById('speedRange');
+    const respawnBtn   = document.getElementById('respawnBtn');
+
+    /**************************************************
+     * 2) UTILITY FUNCTIONS
+     **************************************************/
+    function randomRange(min, max) {
+      return Math.random() * (max - min) + min;
+    }
+    function clamp(val, mn, mx) {
+      return Math.min(mx, Math.max(mn, val));
+    }
+    function distanceSq(ax, ay, bx, by) {
+      let dx = ax - bx;
+      let dy = ay - by;
+      return dx*dx + dy*dy;
+    }
+
+    // Fake Solana address generator (44 base58 chars)
+    function generateFakeSolAddress() {
+      const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+      let addr = '';
+      for (let i = 0; i < 44; i++) {
+        addr += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return addr;
+    }
+    // Return a decimal from 0.1 to 3.0
+    function getRandomBalance() {
+      return (Math.random() * (3.0 - 0.1) + 0.1).toFixed(2);
+    }
+
+    /**************************************************
+     * 3) CREATE ANTS (with Queen)
+     **************************************************/
+    function createAnt(isQueen = false) {
+      const antEl = document.createElement('div');
+      antEl.className = 'ant';
+
+      // If queen, style bigger & red; else pick from categories
+      let category;
+      if (isQueen) {
+        antEl.classList.add('queen');
+        category = { type: 'Queen', color: '#f00' };
+      } else {
+        category = categories[Math.floor(Math.random() * categories.length)];
+        antEl.style.color = category.color;
+      }
+
+      const x = randomRange(0, 3000 - 10); // within the big world
+      const y = randomRange(0, 2000 - 10);
+      const speedVal = parseFloat(speedRange.value);
+      const vx = randomRange(-speedVal, speedVal);
+      const vy = randomRange(-speedVal, speedVal);
+
+      const address = generateFakeSolAddress();
+      const balance = getRandomBalance();
+
+      // Use a small ASCII char
+      antEl.textContent = isQueen ? 'Q' : '.'; 
+
+      // Add event listeners for tooltip
+      antEl.addEventListener('mouseenter', (e) => {
+        showTooltip(e.clientX, e.clientY, category, address, balance);
+      });
+      antEl.addEventListener('mousemove', (e) => {
+        moveTooltip(e.clientX, e.clientY);
+      });
+      antEl.addEventListener('mouseleave', () => {
+        hideTooltip();
+      });
+
+      antsContainer.appendChild(antEl);
+
+      return { x, y, vx, vy, el: antEl, isQueen, category, address, balance };
+    }
+
+    function spawnAnts(count) {
+      clearAnts(); 
+      // Create 1 queen if at least 1 ant
+      let total = count;
+      if (total < 1) total = 1;
+
+      // The first ant we create is the queen
+      const queenAnt = createAnt(true);
+      ants.push(queenAnt);
+      queen = queenAnt;
+
+      // Create the rest
+      for (let i = 1; i < total; i++) {
+        ants.push(createAnt(false));
+      }
+    }
+
+    function clearAnts() {
+      ants.forEach(a => {
+        antsContainer.removeChild(a.el);
+      });
+      ants = [];
+      queen = null;
+    }
+
+    /**************************************************
+     * 4) COLLISIONS & MOTION
+     **************************************************/
+    function updateAnts() {
+      const speedVal = parseFloat(speedRange.value);
+
+      for (let i = 0; i < ants.length; i++) {
+        const a = ants[i];
+
+        // If there's feed, we move them slightly toward (feedX, feedY)
+        // else if not queen, move gently toward queen
+        if (feedMode && feedX != null && feedY != null) {
+          // Attracted to feed
+          const dx = feedX - a.x;
+          const dy = feedY - a.y;
+          a.vx += dx * 0.0002;
+          a.vy += dy * 0.0002;
+        } else if (!a.isQueen && queen) {
+          // Attracted to queen
+          const dx = queen.x - a.x;
+          const dy = queen.y - a.y;
+          a.vx += dx * 0.00005; // smaller force
+          a.vy += dy * 0.00005;
+        }
+
+        // Move
+        a.x += a.vx;
+        a.y += a.vy;
+
+        // Bounds: The world is 3000×2000
+        if (a.x < 0 || a.x > 2990) {
+          a.vx *= -1;
+        }
+        if (a.y < 0 || a.y > 1990) {
+          a.vy *= -1;
+        }
+        // clamp final
+        a.x = clamp(a.x, 0, 2990);
+        a.y = clamp(a.y, 0, 1990);
+      }
+
+      // Collisions
+      for (let i = 0; i < ants.length; i++) {
+        for (let j = i+1; j < ants.length; j++) {
+          const dx = ants[j].x - ants[i].x;
+          const dy = ants[j].y - ants[i].y;
+          const distSq = dx*dx + dy*dy;
+          if (distSq < COLLISION_RADIUS * COLLISION_RADIUS) {
+            const dist = Math.sqrt(distSq) || 1;
+            const pushX = (dx/dist) * BOUNCE_FORCE;
+            const pushY = (dy/dist) * BOUNCE_FORCE;
+            ants[i].vx -= pushX;
+            ants[i].vy -= pushY;
+            ants[j].vx += pushX;
+            ants[j].vy += pushY;
+          }
+        }
+      }
+
+      // Apply final transform
+      ants.forEach(a => {
+        a.el.style.transform = `translate(${a.x}px, ${a.y}px)`;
+      });
+    }
+
+    /**************************************************
+     * 5) ANIMATION LOOP
+     **************************************************/
+    function animate() {
+      updateAnts();
+      requestAnimationFrame(animate);
+    }
+
+    /**************************************************
+     * 6) TOOLTIP
+     **************************************************/
+    function showTooltip(x, y, category, address, balance) {
+      tooltipEl.innerText = `${category.type}\nAddr: ${address}\nBal: ${balance} SOL`;
+      tooltipEl.style.display = 'block';
+      tooltipEl.style.left = (x + 10) + 'px';
+      tooltipEl.style.top  = (y + 10) + 'px';
+    }
+    function moveTooltip(x, y) {
+      tooltipEl.style.left = (x + 10) + 'px';
+      tooltipEl.style.top  = (y + 10) + 'px';
+    }
+    function hideTooltip() {
+      tooltipEl.style.display = 'none';
+    }
+
+    /**************************************************
+     * 7) FEED MODE: CLICK ANYWHERE
+     **************************************************/
+    antsContainer.addEventListener('click', (e) => {
+      // Offsets relative to the container
+      // So we need the click location in container's coordinate system
+      const containerRect = antsContainer.getBoundingClientRect();
+      feedX = e.clientX - containerRect.x;
+      feedY = e.clientY - containerRect.y;
+      feedMode = true;
+
+      if (feedTimer) clearTimeout(feedTimer);
+      // Stop feed mode after 5s
+      feedTimer = setTimeout(() => {
+        feedMode = false;
+        feedX = null;
+        feedY = null;
+      }, 5000);
+    });
+
+    /**************************************************
+     * 8) UI EVENTS
+     **************************************************/
+    function updateStats() {
+      colonyStats.textContent = 
+        `Ants: ${ants.length}, Speed: ${speedRange.value}`;
+    }
+
+    function onRespawn() {
+      const count = parseInt(numAntsRange.value, 10) || 1;
+      spawnAnts(count);
+      updateStats();
+    }
+
+    respawnBtn.addEventListener('click', onRespawn);
+    numAntsRange.addEventListener('input', updateStats);
+    speedRange.addEventListener('input', updateStats);
+
+    /**************************************************
+     * 9) INIT
+     **************************************************/
+    function init() {
+      onRespawn();
+      animate();
+    }
+
+    init();
+  </script>
+</body>
+</html>
